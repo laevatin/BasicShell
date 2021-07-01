@@ -63,7 +63,26 @@ int cmd_exit(unused struct tokens *tokens) {
 }
 
 /* Changes the working directory to the given directory */
+int cmd_cd(struct tokens *tokens) {
+  char *path = tokens_get_token(tokens, 1);
+  if (chdir(path) != -1) {
+    return 1;
+  }
+  printf("An error happens when changing the working directory. errorno: %d.\n", errno);
+  return 0;
+}
 
+/* Prints the current working directory to standard output */
+int cmd_pwd(struct tokens *tokens) {
+  char *path = getcwd(NULL, 0);
+  if (!path) {
+    printf("An error happens when getting the current path.\n");
+    return 0;
+  }
+  printf("%s\n", path);
+  free(path);
+  return 1;
+}
 
 /* Looks up the built-in command, if it exists. */
 int lookup(char cmd[]) {
