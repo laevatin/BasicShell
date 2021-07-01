@@ -33,6 +33,9 @@ int cmd_help(struct tokens *tokens);
 int cmd_pwd(struct tokens *tokens);
 int cmd_cd(struct tokens *tokens);
 
+void try_exec(struct tokens *tokens);
+void command_not_found(const char *cmd);
+
 /* Built-in command functions take token array (see parse.h) and return int */
 typedef int cmd_fun_t(struct tokens *tokens);
 
@@ -118,6 +121,68 @@ void init_shell() {
   }
 }
 
+/* Try to execute the program provided by the user */
+void try_exec(struct tokens *tokens) {
+  char pathbuf[1024];
+  size_t token_length = tokens_get_length(tokens);
+  /* Get the argv and path for the executable */
+  char **args = (char **)malloc(sizeof(char *) * (token_length + 1));
+  char *path = tokens_get_token(tokens, 0);
+
+  for (unsigned int i = 0; i < token_length; i++) 
+    args[i] = tokens_get_token(tokens, i);
+
+  args[token_length] = NULL;
+  /* Forks a new process */
+  pid_t pid = fork();
+
+  int status;
+  /* Parent process */
+  if (pid > 0) {
+    wait(&status);
+    // if (status)
+    //   printf("Program exits with return value %d.\n", WEXITSTATUS(status));
+  } else if (pid == 0) {
+
+    // printf("path: %s\n", path);
+    // printf("args: %s, %s\n", args[0], args[1]);
+    
+    if (execv(path, args) == -1 && errno == ENOENT) {
+      /* Child process */
+      int pathlen = strlen(path);
+      /* Split the PATH string by colon */
+      char *envpath = getenv("PATH");
+      char *p = strtok(envpath, ":");
+
+      while (p) {
+        /* Path too long */
+        if (pathlen + strlen(p) >= 1023) {
+          printf("The path to the executable is too long.\n");
+          return;
+        }
+        
+        strcpy(pathbuf, p);
+        strcat(pathbuf, "/");
+        strcat(pathbuf, path);
+        args[0] = pathbuf;
+
+        if (execv(pathbuf, args) == -1 && errno != ENOENT) {
+          break;
+        }
+        p = strtok(NULL, ":");
+      }
+    }
+    command_not_found(path);
+    exit(1);
+  } else {
+    printf("Failed to create new process.\n");
+  }
+}
+
+void command_not_found(const char *cmd) {
+  printf("%s: command not found.\n", cmd);
+}
+
 int main(unused int argc, unused char *argv[]) {
   init_shell();
 
@@ -138,8 +203,7 @@ int main(unused int argc, unused char *argv[]) {
     if (fundex >= 0) {
       cmd_table[fundex].fun(tokens);
     } else {
-      /* REPLACE this to run commands as programs. */
-      fprintf(stdout, "This shell doesn't know how to run programs.\n");
+      try_exec(tokens);      
     }
 
     if (shell_is_interactive)
