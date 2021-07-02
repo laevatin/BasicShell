@@ -28,12 +28,15 @@ struct termios shell_tmodes;
 /* Process group id for the shell */
 pid_t shell_pgid;
 
+int input_redirect = 0;
+int output_redirect = 0;
+
 int cmd_exit(struct tokens *tokens);
 int cmd_help(struct tokens *tokens);
 int cmd_pwd(struct tokens *tokens);
 int cmd_cd(struct tokens *tokens);
 
-void try_exec(struct tokens *tokens);
+void program_exec(char **args, char *inbuf, char *outbuf);
 void command_not_found(const char *cmd);
 
 /* Built-in command functions take token array (see parse.h) and return int */
@@ -121,21 +124,42 @@ void init_shell() {
   }
 }
 
-/* Try to execute the program provided by the user */
-void try_exec(struct tokens *tokens) {
+void exec_with_pathres(char **args) {
   char pathbuf[1024];
-  size_t token_length = tokens_get_length(tokens);
-  /* Get the argv and path for the executable */
-  char **args = (char **)malloc(sizeof(char *) * (token_length + 1));
-  char *path = tokens_get_token(tokens, 0);
+  char *path = args[0];
 
-  for (unsigned int i = 0; i < token_length; i++) 
-    args[i] = tokens_get_token(tokens, i);
+  if (execv(path, args) == -1 && errno == ENOENT) {
+    int pathlen = strlen(path);
+    /* Split the PATH string by colon */
+    char *envpath = getenv("PATH");
+    char *p = strtok(envpath, ":");
 
-  args[token_length] = NULL;
+    while (p) {
+      /* Path too long */
+      if (pathlen + strlen(p) >= 1023) {
+        printf("The path to the executable is too long.\n");
+        return;
+      }
+      
+      strcpy(pathbuf, p);
+      strcat(pathbuf, "/");
+      strcat(pathbuf, path);
+      args[0] = pathbuf;
+
+      if (execv(pathbuf, args) == -1 && errno != ENOENT) 
+        break;
+      
+      p = strtok(NULL, ":");
+    }
+  }
+  command_not_found(path);
+  exit(1);
+}
+
+/* Try to execute the program provided by the user */
+void program_exec(char **args, char *inbuf, char *outbuf) {
   /* Forks a new process */
   pid_t pid = fork();
-
   int status;
   /* Parent process */
   if (pid > 0) {
@@ -143,37 +167,31 @@ void try_exec(struct tokens *tokens) {
     // if (status)
     //   printf("Program exits with return value %d.\n", WEXITSTATUS(status));
   } else if (pid == 0) {
-
-    // printf("path: %s\n", path);
-    // printf("args: %s, %s\n", args[0], args[1]);
-    
-    if (execv(path, args) == -1 && errno == ENOENT) {
-      /* Child process */
-      int pathlen = strlen(path);
-      /* Split the PATH string by colon */
-      char *envpath = getenv("PATH");
-      char *p = strtok(envpath, ":");
-
-      while (p) {
-        /* Path too long */
-        if (pathlen + strlen(p) >= 1023) {
-          printf("The path to the executable is too long.\n");
-          return;
+    /* Child process */
+    if (input_redirect)
+    {
+        int fd0 = open(inbuf, O_RDONLY);
+        if (fd0 == -1) {
+          printf("Cannot open file: %d\n", errno);
+          exit(1);
         }
-        
-        strcpy(pathbuf, p);
-        strcat(pathbuf, "/");
-        strcat(pathbuf, path);
-        args[0] = pathbuf;
-
-        if (execv(pathbuf, args) == -1 && errno != ENOENT) {
-          break;
-        }
-        p = strtok(NULL, ":");
-      }
+        /* Input redirect for child process */
+        dup2(fd0, STDIN_FILENO);
+        close(fd0);
     }
-    command_not_found(path);
-    exit(1);
+
+    if (output_redirect)
+    {
+        int fd1 = creat(outbuf, (O_RDWR | O_CREAT | O_TRUNC));
+        if (fd1 == -1) {
+          printf("Cannot create file: %d\n", errno);
+          exit(1);
+        }
+        /* Output redirect for child process */
+        dup2(fd1, STDOUT_FILENO);
+        close(fd1);
+    }
+    exec_with_pathres(args);
   } else {
     printf("Failed to create new process.\n");
   }
@@ -200,10 +218,39 @@ int main(unused int argc, unused char *argv[]) {
     /* Find which built-in function to run. */
     int fundex = lookup(tokens_get_token(tokens, 0));
 
+    /* Clear the input and output redirection flag */
+    input_redirect = 0;
+    output_redirect = 0;
+
+    /* input and output filename buffer */
+    char inbuf[128];
+    char outbuf[128];
+
     if (fundex >= 0) {
       cmd_table[fundex].fun(tokens);
     } else {
-      try_exec(tokens);      
+      size_t token_length = tokens_get_length(tokens);
+      /* Get the argv and path for the executable */
+      char **args = (char **)malloc(sizeof(char *) * (token_length + 1));
+
+      args[0] = tokens_get_token(tokens, 0);
+      for (unsigned int i = 1; i < token_length; i++) {
+        /* Search for the redirection symbol '>' '<' */
+        args[i] = tokens_get_token(tokens, i);
+        if (!strcmp(args[i - 1], "<")) {
+          args[i - 1] = NULL;
+          strcpy(inbuf, args[i]);
+          input_redirect = 1;
+        } else if (!strcmp(args[i - 1], ">")) {
+          args[i - 1] = NULL;
+          strcpy(outbuf, args[i]);
+          output_redirect = 1;
+        }
+      }
+
+      args[token_length] = NULL;
+      program_exec(args, inbuf, outbuf);
+      free(args);
     }
 
     if (shell_is_interactive)
