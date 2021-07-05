@@ -13,6 +13,9 @@
 
 #include "tokenizer.h"
 
+#define PIPE_READ 0
+#define PIPE_WRITE 1
+
 /* Convenience macro to silence compiler warnings about unused function parameters. */
 #define unused __attribute__((unused))
 
@@ -36,7 +39,8 @@ int cmd_help(struct tokens *tokens);
 int cmd_pwd(struct tokens *tokens);
 int cmd_cd(struct tokens *tokens);
 
-void program_exec(char **args, char *inbuf, char *outbuf);
+void program_exec(char **args, int pipein, int pipeout);
+void piped_exec(struct tokens *tokens);
 void command_not_found(const char *cmd);
 
 /* Built-in command functions take token array (see parse.h) and return int */
@@ -56,6 +60,10 @@ fun_desc_t cmd_table[] = {
   {cmd_pwd, "pwd", "prints the current working directory to standard output"},
 };
 
+/* input and output filename buffer */
+char inbuf[128];
+char outbuf[128];
+
 /* Prints a helpful description for the given command */
 int cmd_help(unused struct tokens *tokens) {
   for (unsigned int i = 0; i < sizeof(cmd_table) / sizeof(fun_desc_t); i++)
@@ -74,7 +82,7 @@ int cmd_cd(struct tokens *tokens) {
   if (chdir(path) != -1) {
     return 1;
   }
-  printf("An error happens when changing the working directory. errorno: %d.\n", errno);
+  printf("%s: %s.\n", path, strerror(errno));
   return 0;
 }
 
@@ -82,7 +90,7 @@ int cmd_cd(struct tokens *tokens) {
 int cmd_pwd(struct tokens *tokens) {
   char *path = getcwd(NULL, 0);
   if (!path) {
-    printf("An error happens when getting the current path.\n");
+    printf("error: %s.\n", strerror(errno));
     return 0;
   }
   printf("%s\n", path);
@@ -125,58 +133,76 @@ void init_shell() {
 }
 
 void exec_with_pathres(char **args) {
-  char pathbuf[1024];
+  /* Split the PATH string by colon */
+  char *envpath = getenv("PATH");
+  size_t envlen = strlen(envpath);
+  char *pathbuf = (char *)malloc(envlen + 1);
+  char *envbuf = (char *)malloc(envlen + 1);
   char *path = args[0];
 
+  /* Copy the envpath since strtok changes the actual PATH */
+  strcpy(envbuf, envpath);
+
   if (execv(path, args) == -1 && errno == ENOENT) {
-    int pathlen = strlen(path);
-    /* Split the PATH string by colon */
-    char *envpath = getenv("PATH");
-    char *p = strtok(envpath, ":");
+    char *p = strtok(envbuf, ":");
 
     while (p) {
-      /* Path too long */
-      if (pathlen + strlen(p) >= 1023) {
-        printf("The path to the executable is too long.\n");
-        return;
-      }
-      
       strcpy(pathbuf, p);
       strcat(pathbuf, "/");
       strcat(pathbuf, path);
       args[0] = pathbuf;
 
-      if (execv(pathbuf, args) == -1 && errno != ENOENT) 
+      if (execv(args[0], args) == -1 && errno != ENOENT) 
         break;
       
       p = strtok(NULL, ":");
     }
   }
+
+  free(pathbuf);
+  free(envbuf);
   command_not_found(path);
-  exit(1);
+  exit(EXIT_FAILURE);
 }
 
 /* Try to execute the program provided by the user */
-void program_exec(char **args, char *inbuf, char *outbuf) {
+void program_exec(char **args, int pipein, int pipeout) {
   /* Forks a new process */
   pid_t pid = fork();
   int status;
+
   /* Parent process */
   if (pid > 0) {
     wait(&status);
-    // if (status)
-    //   printf("Program exits with return value %d.\n", WEXITSTATUS(status));
   } else if (pid == 0) {
     /* Child process */
+    if (pipein != -1) {
+      /* There is pipe */
+      if (dup2(pipein, STDIN_FILENO) == -1) {
+        perror("dup2 error.");
+        exit(EXIT_FAILURE);
+      }
+
+      if (dup2(pipeout, STDOUT_FILENO) == -1) {
+        perror("dup2 error.");
+        exit(EXIT_FAILURE);
+      }
+    }
+
     if (input_redirect)
     {
         int fd0 = open(inbuf, O_RDONLY);
         if (fd0 == -1) {
-          printf("Cannot open file: %d\n", errno);
-          exit(1);
+          printf("Cannot open file: %s\n", strerror(errno));
+          exit(EXIT_FAILURE);
         }
+
         /* Input redirect for child process */
-        dup2(fd0, STDIN_FILENO);
+        if (dup2(fd0, STDIN_FILENO) == -1) {
+          perror("dup2 error.");
+          exit(EXIT_FAILURE);
+        }
+          
         close(fd0);
     }
 
@@ -184,17 +210,97 @@ void program_exec(char **args, char *inbuf, char *outbuf) {
     {
         int fd1 = creat(outbuf, (O_RDWR | O_CREAT | O_TRUNC));
         if (fd1 == -1) {
-          printf("Cannot create file: %d\n", errno);
-          exit(1);
+          printf("Cannot create file: %s\n", strerror(errno));
+          exit(EXIT_FAILURE);
         }
+
         /* Output redirect for child process */
-        dup2(fd1, STDOUT_FILENO);
+        if (dup2(fd1, STDOUT_FILENO) == -1) {
+          perror("dup2 error.");
+          exit(EXIT_FAILURE);
+        }
+
         close(fd1);
     }
+
     exec_with_pathres(args);
   } else {
-    printf("Failed to create new process.\n");
+    printf("Failed to create new process: %s.\n", strerror(errno));
   }
+}
+
+/* Execute the programs with pipe */
+void piped_exec(struct tokens *tokens) {
+  int token_len = tokens_get_length(tokens);
+  char **args = (char **)malloc(sizeof(char *) * (token_len + 1));
+  int j = 1;
+  int prevpipe[2] = {-1, -1};
+  int curpipe[2] = {-1, -1};
+
+  args[0] = tokens_get_token(tokens, 0);
+  char *prevtok = args[0];
+
+  for (int i = 1; i < token_len; i++) {
+    char *curtok = tokens_get_token(tokens, i);
+    args[j++] = curtok;
+
+    /* j is guaranteed to be greater than 1 */
+    if (!strcmp(prevtok, "|")) {
+      /* Change prevtok in args to NULL */
+      args[j - 2] = NULL;
+      // printf("exec: %s, %s\n", args[0], args[1]);
+
+      /* Check pipe state */
+      if (pipe(curpipe) == -1) {
+        perror("pipe cannot be created.");
+        return;
+      }
+
+      /* If the program is the first one, it reads from STDIN */
+      if (prevpipe[PIPE_READ] == -1)
+        program_exec(args, STDIN_FILENO, curpipe[PIPE_WRITE]);
+      else 
+        program_exec(args, prevpipe[PIPE_READ], curpipe[PIPE_WRITE]);
+
+      /* Close the used pipes */
+      if (prevpipe[PIPE_READ] != -1) {
+        close(prevpipe[PIPE_READ]);
+        close(prevpipe[PIPE_WRITE]);
+      }
+
+      memcpy(prevpipe, curpipe, sizeof(prevpipe));
+      /* Reset the index for program arguments */
+      args[0] = curtok;
+      j = 1;
+
+      /* Reset the redirection flags */
+      input_redirect = 0;
+      output_redirect = 0;
+    } else if (!strcmp(prevtok, "<")) {
+      args[j - 2] = NULL;
+      strcpy(inbuf, curtok);
+      input_redirect = 1;
+    } else if (!strcmp(prevtok, ">")) {
+      args[j - 2] = NULL;
+      strcpy(outbuf, curtok);
+      output_redirect = 1;
+    }
+
+    prevtok = curtok;
+  }
+
+  args[j] = NULL;
+  // printf("exec: %s, %s, %d, %d\n", args[0], args[1], curpipe[PIPE_READ], STDOUT_FILENO);
+  /* The last one output to STDOUT if no redirection */
+  program_exec(args, curpipe[PIPE_READ], STDOUT_FILENO);
+
+  /* Close the used pipes */
+  if (prevpipe[PIPE_READ] != -1) {
+    close(prevpipe[PIPE_READ]);
+    close(prevpipe[PIPE_WRITE]);
+  }
+
+  free(args);
 }
 
 void command_not_found(const char *cmd) {
@@ -203,7 +309,7 @@ void command_not_found(const char *cmd) {
 
 int main(unused int argc, unused char *argv[]) {
   init_shell();
-
+  
   static char line[4096];
   int line_num = 0;
 
@@ -222,35 +328,11 @@ int main(unused int argc, unused char *argv[]) {
     input_redirect = 0;
     output_redirect = 0;
 
-    /* input and output filename buffer */
-    char inbuf[128];
-    char outbuf[128];
-
     if (fundex >= 0) {
       cmd_table[fundex].fun(tokens);
-    } else {
-      size_t token_length = tokens_get_length(tokens);
-      /* Get the argv and path for the executable */
-      char **args = (char **)malloc(sizeof(char *) * (token_length + 1));
-
-      args[0] = tokens_get_token(tokens, 0);
-      for (unsigned int i = 1; i < token_length; i++) {
-        /* Search for the redirection symbol '>' '<' */
-        args[i] = tokens_get_token(tokens, i);
-        if (!strcmp(args[i - 1], "<")) {
-          args[i - 1] = NULL;
-          strcpy(inbuf, args[i]);
-          input_redirect = 1;
-        } else if (!strcmp(args[i - 1], ">")) {
-          args[i - 1] = NULL;
-          strcpy(outbuf, args[i]);
-          output_redirect = 1;
-        }
-      }
-
-      args[token_length] = NULL;
-      program_exec(args, inbuf, outbuf);
-      free(args);
+    } else if (tokens_get_token(tokens, 0)) {
+      /* Skip empty input */
+      piped_exec(tokens);
     }
 
     if (shell_is_interactive)
