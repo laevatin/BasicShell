@@ -129,6 +129,13 @@ void init_shell() {
 
     /* Save the current termios to a variable, so it can be restored later. */
     tcgetattr(shell_terminal, &shell_tmodes);
+
+    /* Ignore the signals should not be received by the shell */
+    signal(SIGINT, SIG_IGN);
+    signal(SIGQUIT, SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
+    signal(SIGCONT, SIG_IGN);    
   }
 }
 
@@ -173,50 +180,78 @@ void program_exec(char **args, int pipein, int pipeout) {
 
   /* Parent process */
   if (pid > 0) {
-    wait(&status);
+    /* Ignore the SIGTTOU */
+    signal(SIGTTOU, SIG_IGN);
+
+    /* Set child to its own process group */
+    if (setpgid(pid, pid) < 0) {
+      perror("setpgid failed");
+    }
+
+    /* Put child process to foreground */
+    if (tcsetpgrp(STDIN_FILENO, pid) < 0) {
+      perror("tcsetpgrp failed");
+    }
+
+    /* Wait the child process to finish */
+    if (wait(&status) == -1) {
+      perror("wait failed");
+    }
+    printf("status: %d\n", status);
+
+    /* Put parent process to foreground */
+    if (tcsetpgrp(STDIN_FILENO, shell_pgid) < 0) {
+      perror("tcsetpgrp failed");
+    }
+    /* Reset SIGTTOU */
+    signal(SIGTTOU, SIG_DFL);
+
   } else if (pid == 0) {
     /* Child process */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGQUIT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGTSTP, SIG_DFL);
+    signal(SIGCONT, SIG_DFL);
     if (pipein != -1) {
       /* There is pipe */
       if (dup2(pipein, STDIN_FILENO) == -1) {
-        perror("dup2 error.");
+        perror("dup2 error");
         exit(EXIT_FAILURE);
       }
 
       if (dup2(pipeout, STDOUT_FILENO) == -1) {
-        perror("dup2 error.");
+        perror("dup2 error");
         exit(EXIT_FAILURE);
       }
     }
 
-    if (input_redirect)
-    {
+    if (input_redirect) {
         int fd0 = open(inbuf, O_RDONLY);
         if (fd0 == -1) {
-          printf("Cannot open file: %s\n", strerror(errno));
+          perror("Cannot open file");
           exit(EXIT_FAILURE);
         }
 
         /* Input redirect for child process */
         if (dup2(fd0, STDIN_FILENO) == -1) {
-          perror("dup2 error.");
+          perror("dup2 error");
           exit(EXIT_FAILURE);
         }
           
         close(fd0);
     }
 
-    if (output_redirect)
-    {
+    if (output_redirect) {
         int fd1 = creat(outbuf, (O_RDWR | O_CREAT | O_TRUNC));
         if (fd1 == -1) {
-          printf("Cannot create file: %s\n", strerror(errno));
+          perror("Cannot create file");
           exit(EXIT_FAILURE);
         }
 
         /* Output redirect for child process */
         if (dup2(fd1, STDOUT_FILENO) == -1) {
-          perror("dup2 error.");
+          perror("dup2 error");
           exit(EXIT_FAILURE);
         }
 
@@ -252,7 +287,7 @@ void piped_exec(struct tokens *tokens) {
 
       /* Check pipe state */
       if (pipe(curpipe) == -1) {
-        perror("pipe cannot be created.");
+        perror("pipe cannot be created");
         return;
       }
 
